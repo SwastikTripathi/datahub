@@ -7907,8 +7907,11 @@ def _get_warehouse_dm_fgl_overrides() -> Dict[str, Dict]:
       - Customer Id  -> columnId=inode-<url_id>/CUSTOMER_ID  formula=[CUSTOMERS/Customer Id]
       - Email        -> columnId=inode-<url_id>/EMAIL         formula=[CUSTOMERS/Email]
       - First Name   -> columnId=inode-<url_id>/FIRST_NAME    formula=[CUSTOMERS/First Name]
+      - Last Name    -> columnId=<url_id>/LAST_NAME           formula=[CUSTOMERS/Last Name]
 
-    All three resolve to warehouse schemaField URNs via columnId-based FGL resolution.
+    The first three resolve via the inode columnId. The last is shaped like
+    the pass-through columns /columns returned on our dev tenant: the url_id
+    without the inode- prefix, and the native column name.
     """
     overrides = _get_warehouse_dm_overrides()
     # Replace the columns endpoint with passthrough formula columns.
@@ -7943,8 +7946,16 @@ def _get_warehouse_dm_fgl_overrides() -> Dict[str, Dict]:
                     "formula": "[CUSTOMERS/First Name]",
                     "type": {"type": "text"},
                 },
+                {
+                    "elementId": _WH_ELEMENT_ID,
+                    "name": "Last Name",
+                    "columnId": f"{_WH_URL_ID}/LAST_NAME",
+                    "label": "Last Name",
+                    "formula": "[CUSTOMERS/Last Name]",
+                    "type": {"type": "text"},
+                },
             ],
-            "total": 3,
+            "total": 4,
             "nextPage": None,
         },
     }
@@ -7962,9 +7973,10 @@ def test_sigma_ingest_data_models_dm_element_warehouse_fgl(
     the warehouse column identity (inode-<url_id>/<WAREHOUSE_COL>).
 
     Assertions:
-      - 3 FineGrainedLineage entries on the DM-element child Dataset
+      - 4 FineGrainedLineage entries on the DM-element child Dataset
       - Upstream schemaField parent URN matches the entity-level warehouse URN
       - warehouse_resolved == 3; warehouse_passthrough_deferred == 0
+      - the <url_id>/LAST_NAME column gets an exact edge to last_name
       - No new entity-level Upstream entries (FGL-only)
     """
     test_resources_dir = pytestconfig.rootpath / "tests/integration/sigma"
@@ -7989,6 +8001,8 @@ def test_sigma_ingest_data_models_dm_element_warehouse_fgl(
         f"expected 3 warehouse FGL resolved; got {report.data_model_element_fgl_warehouse_resolved}"
     )
     assert report.data_model_element_fgl_warehouse_passthrough_deferred == 0
+    assert report.data_model_element_fgl_warehouse_table_name_resolved == 1
+    assert report.data_model_element_fgl_warehouse_table_name_declined == 0
 
     expected_warehouse_urn = (
         "urn:li:dataset:(urn:li:dataPlatform:snowflake,"
@@ -8007,7 +8021,11 @@ def test_sigma_ingest_data_models_dm_element_warehouse_fgl(
     ]
     assert len(ul_aspects) == 1
     fgls = ul_aspects[0]["aspect"]["json"].get("fineGrainedLineages", [])
-    assert len(fgls) == 3, f"expected 3 FGL entries; got {len(fgls)}: {fgls}"
+    assert len(fgls) == 4, f"expected 4 FGL entries; got {len(fgls)}: {fgls}"
+    last_name = [f for f in fgls if f["downstreams"][0].endswith(",Last Name)")]
+    assert [(f["upstreams"], f["confidenceScore"]) for f in last_name] == [
+        ([f"urn:li:schemaField:({expected_warehouse_urn},last_name)"], 1.0)
+    ]
     # Each FGL upstream must be a schemaField on the warehouse dataset.
     for fgl in fgls:
         for upstream in fgl.get("upstreams", []):
