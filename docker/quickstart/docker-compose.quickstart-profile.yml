@@ -46,6 +46,35 @@ services:
       target: /home/datahub/.aws/sso/cache
       bind:
         create_host_path: true
+  datahub-ai-service-quickstart:
+    profiles:
+    - quickstart
+    - quickstart-frontend
+    - quickstart-opensearch2
+    - quickstart-opensearch3
+    - quickstart-cassandra
+    - quickstart-consumers
+    - quickstart-consumers-cdc
+    - quickstart-postgres
+    - quickstart-postgres-cdc
+    - quickstart-postgres-consumers
+    environment:
+      DATAHUB_AI_MCP_ENABLED: ${DATAHUB_AI_MCP_ENABLED:-true}
+      DATAHUB_AI_PORT: '9005'
+      DATAHUB_AI_TRUSTED_PROXIES: datahub-frontend-react
+      DATAHUB_GMS_URL: http://datahub-gms:8080
+    hostname: datahub-ai-service
+    image: ${DATAHUB_AI_IMAGE:-acryldata/datahub-ai-service}:${DATAHUB_VERSION}
+    networks:
+      default: null
+    ports:
+    - mode: ingress
+      host_ip: 127.0.0.1
+      target: 9005
+      published: ${DATAHUB_MAPPED_AI_PORT:-9005}
+      protocol: tcp
+    restart: on-failure
+    stop_grace_period: 30s
   datahub-gms-quickstart:
     profiles:
     - quickstart
@@ -103,6 +132,7 @@ services:
       MCE_CONSUMER_ENABLED: 'true'
       MCL_CONSUMER_BATCH_ENABLED: 'true'
       MCP_CONSUMER_BATCH_ENABLED: 'true'
+      MCP_SERVER_ENABLED: ${MCP_SERVER_ENABLED:-false}
       METADATA_SERVICE_AUTH_ENABLED: 'false'
       NEO4J_HOST: http://neo4j:7474
       NEO4J_PASSWORD: datahub
@@ -173,6 +203,7 @@ services:
         condition: service_completed_successfully
         required: true
     environment:
+      DATAHUB_AI_SERVICE_URL: http://datahub-ai-service:9005
       DATAHUB_APP_VERSION: ${DATAHUB_VERSION}
       DATAHUB_BASE_PATH: /
       DATAHUB_GMS_BASE_PATH: /

@@ -514,6 +514,8 @@ See [scripts/dev/README.md](scripts/dev/README.md) for details and offline tests
 | `datahub-graphql-core/`           | `datahub-gms`                                 |
 | `metadata-io/`                    | `datahub-gms`                                 |
 | `datahub-frontend/`               | `datahub-frontend-react`                      |
+| `packages/datahub-ai-service/`    | `datahub-ai-service`                          |
+| `packages/datahub-mcp-tools/`     | `datahub-ai-service`                          |
 | `metadata-jobs/mce-consumer-job/` | `datahub-mce-consumer`                        |
 | `metadata-jobs/mae-consumer-job/` | `datahub-mae-consumer`                        |
 | `metadata-models/`                | All (triggers full rebuild + code generation) |
