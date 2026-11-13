@@ -181,6 +181,8 @@ Requirements:
 
 ### Other Notable Changes
 
+- [#21116](https://github.com/datahub-project/datahub/pull/21116) **(GMS / Search)** New `siblingGroups` GraphQL query, used by the search "Show siblings" option and the dataset "Composed of" section. It is off by default: set `GRAPHQL_QUERY_MAX_SIBLING_GROUP_URNS` above 0 (the search UI sends up to 30 urns per page) to turn it on. Each request walks up to 1,000 sibling-group members per dataset, and with view authorization on (`VIEW_AUTHORIZATION_ENABLED`) it view-checks every member, so test it on your largest sibling groups before enabling. **Action:** none unless you want the feature.
+
 - [#21155](https://github.com/datahub-project/datahub/pull/21155) **(Ingestion / datahub-gc)** The soft-deleted entity cleanup no longer hard-deletes a soft-deleted container that still has child entities, including soft-deleted, draft or hidden ones (on a server without the `includeHiddenLifecycleStages` search flag, hidden children are not counted). Hard-deleting it left every child linked to a container that no longer exists (before #20589, it removed the link altogether), so the subtree could not be restored. Such containers now stay soft-deleted, are counted in `num_soft_deleted_containers_retained_with_children`, and are listed in the run report. A subtree that is soft-deleted as a whole is now removed one level per run, children first, so a tree N levels deep takes N runs. **Action:** none. Restore the container to bring its subtree back, or delete its children so a later run can remove it.
 
 - [#20589](https://github.com/datahub-project/datahub/pull/20589) **(Ingestion / datahub-gc, CLI)** When the soft-deleted entity cleanup hard-deletes an entity, it now removes references to it only for the types `datahub delete --hard` already handles this way: tags, users, groups, domains, glossary terms and nodes, forms and roles. Before, it did this for every type, which could delete data from entities that still exist. Purging a data flow hard-deleted all of its data jobs, including live ones, and purging a container removed the parent link from all of its children. References to other purged entities, such as a dataset listed in another dataset's upstream lineage, now stay in place, as they already do after `datahub delete --hard`. Both commands now also remove references before the hard delete rather than after, so the cleanup no longer misses them. Roles can now be soft-deleted. **Action:** none.
@@ -249,6 +251,8 @@ Requirements:
 [#19758](https://github.com/datahub-project/datahub/pull/19758) **(Ingestion / MicroStrategy)** The `microstrategy` extra now installs the SQL parsing dependencies, and ingestion fails at startup with a configuration error if they are missing while SQL lineage is enabled. Previously every SQL view failed to parse, each with its own warning, and lineage was emitted empty.
 
 ### Environment Variables
+
+- `GRAPHQL_QUERY_MAX_SIBLING_GROUP_URNS` (default `0`) — Max datasets one `siblingGroups` request may ask for; `0` keeps the query off. Raising it enables the search "Show siblings" view and the full "Composed of" list. See Other Notable Changes.
 
 ## v1.9.0
 
