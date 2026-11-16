@@ -181,7 +181,11 @@ Requirements:
 
 - **(Ingestion / REST emitter)** Emitting a `MetadataChangeEvent` with `DatahubRestEmitter` or `DataHubGraph` (`emit` or `emit_mce`) is deprecated and will be removed in a future release. **Action:** emit `MetadataChangeProposalWrapper` instead.
 
+- **(Ingestion / file source)** Reading `MetadataChangeEvent` records with the `file` source is deprecated and will be removed in a future release. The run report shows a warning for each file that contains them. **Action:** rewrite the file as MCPs, for example by running it through the `file` source into the `file` sink.
+
 ### Other Notable Changes
+
+- **(Ingestion / file source)** The `file` source now turns each `MetadataChangeEvent` it reads into one MCP per aspect, so transformers and sinks receive MCPs only. A `file` sink fed from it writes MCPs, and a custom transformer that handles only MCEs no longer sees these records. The stored aspects are the same. **Action:** none, unless a custom transformer expects MCEs from a file.
 
 - **(Ingestion / REST emitter)** `DatahubRestEmitter` and `DataHubGraph` now send a `MetadataChangeEvent` as one MCP per aspect through `ingestProposal` (or the OpenAPI endpoint with `openapi_ingestion` on) instead of posting it to `/entities?action=ingest`. This also applies to the `datahub-rest` sink in `SYNC` and `ASYNC` mode; the default `ASYNC_BATCH` mode already sent MCPs. The stored aspects are the same, and the `emit_mode` passed to `emit` now applies to MCEs too. An MCE is no longer written all-or-nothing: if GMS rejects one aspect, the aspects before it stay stored, `emit` raises for the rejected one and the rest are not sent. An MCE with no aspects is no longer sent at all. **Action:** none, unless you rely on an MCE being written atomically.
 
