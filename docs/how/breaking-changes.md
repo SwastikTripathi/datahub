@@ -179,7 +179,11 @@ Requirements:
 
 - [#20962](https://github.com/datahub-project/datahub/pull/20962) **(Ingestion / Kafka emitter, Airflow)** Emitting a `MetadataChangeEvent` with `DatahubKafkaEmitter` (`emit` or `emit_mce_async`) is deprecated. **Action:** emit `MetadataChangeProposalWrapper` instead.
 
+- **(Ingestion / REST emitter)** Emitting a `MetadataChangeEvent` with `DatahubRestEmitter` or `DataHubGraph` (`emit` or `emit_mce`) is deprecated and will be removed in a future release. **Action:** emit `MetadataChangeProposalWrapper` instead.
+
 ### Other Notable Changes
+
+- **(Ingestion / REST emitter)** `DatahubRestEmitter` and `DataHubGraph` now send a `MetadataChangeEvent` as one MCP per aspect through `ingestProposal` (or the OpenAPI endpoint with `openapi_ingestion` on) instead of posting it to `/entities?action=ingest`. This also applies to the `datahub-rest` sink in `SYNC` and `ASYNC` mode; the default `ASYNC_BATCH` mode already sent MCPs. The stored aspects are the same, and the `emit_mode` passed to `emit` now applies to MCEs too. An MCE is no longer written all-or-nothing: if GMS rejects one aspect, the aspects before it stay stored, `emit` raises for the rejected one and the rest are not sent. An MCE with no aspects is no longer sent at all. **Action:** none, unless you rely on an MCE being written atomically.
 
 - [#21155](https://github.com/datahub-project/datahub/pull/21155) **(Ingestion / datahub-gc)** The soft-deleted entity cleanup no longer hard-deletes a soft-deleted container that still has child entities, including soft-deleted, draft or hidden ones (on a server without the `includeHiddenLifecycleStages` search flag, hidden children are not counted). Hard-deleting it left every child linked to a container that no longer exists (before #20589, it removed the link altogether), so the subtree could not be restored. Such containers now stay soft-deleted, are counted in `num_soft_deleted_containers_retained_with_children`, and are listed in the run report. A subtree that is soft-deleted as a whole is now removed one level per run, children first, so a tree N levels deep takes N runs. **Action:** none. Restore the container to bring its subtree back, or delete its children so a later run can remove it.
 
