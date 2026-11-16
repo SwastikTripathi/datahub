@@ -1,5 +1,6 @@
 import json
 import ssl
+import threading
 from typing import Dict, List, Optional, Tuple, Union
 from unittest.mock import MagicMock, patch
 
@@ -8,13 +9,16 @@ import requests
 
 from datahub.ingestion.api.common import PipelineContext
 from datahub.ingestion.source.common.subtypes import DatasetSubTypes
-from datahub.ingestion.source.qlik_sense.config import QlikSourceConfig
+from datahub.ingestion.source.qlik_sense.config import Constant, QlikSourceConfig
 from datahub.ingestion.source.qlik_sense.data_classes import (
     App,
     Chart,
     QlikTable,
+    SchemaField,
     Sheet,
+    UnreadItem,
 )
+from datahub.ingestion.source.qlik_sense.qlik_api import QlikAPI
 from datahub.ingestion.source.qlik_sense.qlik_onprem_api import (
     UNPUBLISHED_APPS_NAME,
     QlikOnPremAPI,
@@ -25,11 +29,15 @@ from datahub.ingestion.source.qlik_sense.script_lineage import (
     ScriptTableLineage,
     infer_data_connection,
 )
-from datahub.ingestion.source.qlik_sense.websocket_connection import WebsocketConnection
+from datahub.ingestion.source.qlik_sense.websocket_connection import (
+    EngineError,
+    WebsocketConnection,
+)
 from datahub.metadata.schema_classes import (
     ChangeTypeClass,
     ChartInfoClass,
     DashboardInfoClass,
+    InputFieldsClass,
     MetadataChangeProposalClass,
     SubTypesClass,
     UpstreamLineageClass,
@@ -41,6 +49,7 @@ from tests.unit.qlik_sense.qlik_fakes import (
     ON_PREM,
     ONPREM_CONFIG,
     SHEET_META,
+    STREAM,
     FakeResponse,
     fake_engine_calls,
     fake_qrs_get,
@@ -78,7 +87,7 @@ def test_onprem_lists_stream_and_opens_app(
     # The user id joins with users ingested from AD or LDAP; the name would not.
     assert api.get_user_name("user-1") == "ada"
 
-    items = api.get_items("stream-1")
+    items = list(api.get_items(["stream-1"]))
     assert len(items) == 1
     app = items[0]
     assert isinstance(app, App)
@@ -116,7 +125,7 @@ def test_onprem_keeps_app_when_engine_is_unreachable(
 
     api = QlikOnPremAPI(QlikSourceConfig.model_validate(ONPREM_CONFIG))
     api.get_spaces()
-    items = api.get_items("stream-1")
+    items = list(api.get_items(["stream-1"]))
 
     assert len(items) == 1
     app = items[0]
@@ -155,9 +164,10 @@ def test_onprem_closes_engine_session_when_app_cannot_open(
 
     api = QlikOnPremAPI(QlikSourceConfig.model_validate(ONPREM_CONFIG))
     api.get_spaces()
-    items = api.get_items("stream-1")
+    items = list(api.get_items(["stream-1"]))
 
     assert [item.id for item in items] == ["app-1"]
+    assert isinstance(items[0], App) and not items[0].sheets_complete
     websocket.close_websocket.assert_called_once()
 
 
@@ -171,6 +181,180 @@ def _chart_layout(chart_id: str) -> Dict[str, object]:
             "qHyperCube": {"qDimensionInfo": [], "qMeasureInfo": []},
         }
     }
+
+
+@patch(
+    "datahub.ingestion.source.qlik_sense.qlik_onprem_api.WebsocketConnection.for_on_prem"
+)
+@patch("datahub.ingestion.source.qlik_sense.qlik_onprem_api.requests.Session")
+def test_onprem_loads_apps_in_parallel(
+    mock_session_cls: MagicMock, mock_engine: MagicMock
+) -> None:
+    app_ids = [f"app-{i}" for i in range(6)]
+    lock = threading.Lock()
+    in_flight = 0
+    peak = 0
+
+    def qrs_get(
+        url: str, params: Optional[Dict[str, str]] = None, **kwargs: object
+    ) -> FakeResponse:
+        if url.endswith("/app/full"):
+            return FakeResponse([{**APP, "id": app_id} for app_id in app_ids])
+        return fake_qrs_get(url, params, **kwargs)
+
+    # The first read waits until a second one is running, so the reads only
+    # finish when they really overlap.
+    overlapping = threading.Event()
+
+    def get_script() -> str:
+        nonlocal in_flight, peak
+        with lock:
+            in_flight += 1
+            peak = max(peak, in_flight)
+            if in_flight > 1:
+                overlapping.set()
+        overlapping.wait(timeout=10)
+        with lock:
+            in_flight -= 1
+        return "// script"
+
+    def open_engine(app_id: str, **_: object) -> MagicMock:
+        if app_id == "app-2":
+            raise OSError("engine session limit")
+        websocket = MagicMock()
+        websocket.websocket_send_request.side_effect = fake_engine_calls()
+        websocket.get_script.side_effect = get_script
+        return websocket
+
+    session = mock_session_cls.return_value
+    session.headers = {}
+    session.get.side_effect = qrs_get
+    mock_engine.side_effect = open_engine
+
+    api = QlikOnPremAPI(
+        QlikSourceConfig.model_validate({**ONPREM_CONFIG, "max_workers": 3})
+    )
+    api.get_spaces()
+    items = {item.id: item for item in api.get_items(["stream-1"])}
+
+    assert sorted(items) == app_ids
+    assert overlapping.is_set()
+    assert 1 < peak <= 3
+    for app_id, item in items.items():
+        assert isinstance(item, App)
+        expected_sheets = [] if app_id == "app-2" else ["Overview"]
+        assert [sheet.title for sheet in item.sheets] == expected_sheets
+        # A failed read must not leak into other apps read on the same thread.
+        assert item.read_complete is (app_id != "app-2")
+
+
+@patch(
+    "datahub.ingestion.source.qlik_sense.qlik_onprem_api.WebsocketConnection.for_on_prem"
+)
+@patch("datahub.ingestion.source.qlik_sense.qlik_onprem_api.requests.Session")
+def test_onprem_reads_apps_of_different_streams_in_parallel(
+    mock_session_cls: MagicMock, mock_engine: MagicMock
+) -> None:
+    streams = [
+        {**STREAM, "id": "stream-1"},
+        {**STREAM, "id": "stream-2", "name": "Finance"},
+        {**STREAM, "id": "stream-3", "name": "Sales"},
+    ]
+
+    def qrs_get(
+        url: str, params: Optional[Dict[str, str]] = None, **kwargs: object
+    ) -> FakeResponse:
+        if url.endswith("/stream/full"):
+            return FakeResponse(streams)
+        if url.endswith("/app/full"):
+            assert params is not None
+            stream_id = params["filter"].rsplit(" ", 1)[-1]
+            if stream_id == "stream-3":
+                return FakeResponse({}, status_code=503)
+            count = 5 if stream_id == "stream-1" else 1
+            return FakeResponse(
+                [
+                    {
+                        **APP,
+                        "id": f"app-{i}-of-{stream_id}",
+                        "stream": {"id": stream_id},
+                    }
+                    for i in range(count)
+                ]
+            )
+        return fake_qrs_get(url, params, **kwargs)
+
+    # Apps of the large stream-1 only finish once the app of stream-2 has
+    # started, so the reads fail if stream-2 waits behind all of stream-1.
+    other_stream_started = threading.Event()
+
+    def get_script(app_id: str) -> str:
+        if app_id.endswith("stream-2"):
+            other_stream_started.set()
+        elif not other_stream_started.wait(timeout=10):
+            raise TimeoutError(app_id)
+        return ""
+
+    def open_engine(app_id: str, **_: object) -> MagicMock:
+        websocket = MagicMock()
+        websocket.websocket_send_request.side_effect = fake_engine_calls()
+        websocket.get_script.side_effect = lambda: get_script(app_id)
+        return websocket
+
+    session = mock_session_cls.return_value
+    session.headers = {}
+    session.get.side_effect = qrs_get
+    mock_engine.side_effect = open_engine
+
+    api = QlikOnPremAPI(
+        QlikSourceConfig.model_validate({**ONPREM_CONFIG, "max_workers": 2})
+    )
+    api.get_spaces()
+    items = list(api.get_items(["stream-1", "stream-2", "stream-3"]))
+
+    assert sorted(item.id for item in items) == sorted(
+        [*(f"app-{i}-of-stream-1" for i in range(5)), "app-0-of-stream-2"]
+    )
+    assert all(isinstance(item, App) and item.read_complete for item in items)
+    assert [unread.name for unread in api.unread_items] == ["apps of stream stream-3"]
+
+
+@patch("datahub.ingestion.source.qlik_sense.qlik_onprem_api.requests.Session")
+def test_items_of_next_space_are_listed_only_after_first_item_is_taken(
+    mock_session_cls: MagicMock,
+) -> None:
+    listed: List[str] = []
+
+    def list_items(space_id: str) -> List[Dict]:
+        listed.append(space_id)
+        return [{"id": f"{space_id}-{i}"} for i in range(2)]
+
+    api = QlikOnPremAPI(QlikSourceConfig.model_validate(ONPREM_CONFIG))
+    with patch.object(api, "_list_items", side_effect=list_items):
+        items = api._items_in_turn(["stream-1", "stream-2"])
+        assert next(items) == ("stream-1", {"id": "stream-1-0"})
+        assert listed == ["stream-1"]
+        assert [item["id"] for _, item in items] == [
+            "stream-2-0",
+            "stream-1-1",
+            "stream-2-1",
+        ]
+
+
+@patch("datahub.ingestion.source.qlik_sense.qlik_onprem_api.requests.Session")
+def test_onprem_unexpected_app_error_records_app_id(
+    mock_session_cls: MagicMock,
+) -> None:
+    session = mock_session_cls.return_value
+    session.headers = {}
+    session.get.side_effect = fake_qrs_get
+    api = QlikOnPremAPI(QlikSourceConfig.model_validate(ONPREM_CONFIG))
+    api.get_spaces()
+
+    with patch.object(api, "_read_app", side_effect=RuntimeError("boom")):
+        assert list(api.get_items(["stream-1"])) == []
+
+    assert api.unread_items == [UnreadItem(name=APP["id"], cause="boom")]
 
 
 def test_chart_keeps_dimension_in_error_state() -> None:
@@ -189,6 +373,8 @@ def test_chart_keeps_dimension_in_error_state() -> None:
         ("Region", "0"),
         (None, None),
     ]
+    # Neither dimension lists its fields, so the chart may read any of them.
+    assert not chart.fields_complete
 
 
 def test_chart_without_title_is_kept() -> None:
@@ -247,7 +433,11 @@ def test_onprem_unread_load_script_leaves_app_tables_unknown(
     assert not app.read_complete
 
 
-def _sheet_replies(chart_ids: List[str]) -> List[object]:
+def _sheet_replies(
+    chart_ids: List[str], chart_properties: Optional[List[Dict]] = None
+) -> List[object]:
+    # Without chart_properties the property tree is empty, so each chart's
+    # properties are read on their own.
     return [
         {"qReturn": {"qHandle": 1}},
         {"qList": [{"qInfo": {"qId": "sheet-1", "qType": "sheet"}}]},
@@ -258,6 +448,15 @@ def _sheet_replies(chart_ids: List[str]) -> List[object]:
                 "qChildList": {
                     "qItems": [{"qInfo": {"qId": chart_id}} for chart_id in chart_ids]
                 },
+            }
+        },
+        {
+            "qPropEntry": {
+                "qProperty": {"qInfo": {"qId": "sheet-1"}},
+                "qChildren": [
+                    {"qProperty": prop, "qChildren": []}
+                    for prop in chart_properties or []
+                ],
             }
         },
     ]
@@ -272,9 +471,61 @@ def _read_onprem_app(
     session.get.side_effect = fake_qrs_get
     api = QlikOnPremAPI(QlikSourceConfig.model_validate(ONPREM_CONFIG))
     api.get_spaces()
-    (app,) = api.get_items("stream-1")
+    (app,) = api.get_items(["stream-1"])
     assert isinstance(app, App)
     return app
+
+
+@patch(
+    "datahub.ingestion.source.qlik_sense.qlik_onprem_api.WebsocketConnection.for_on_prem"
+)
+@patch("datahub.ingestion.source.qlik_sense.qlik_onprem_api.requests.Session")
+def test_unreadable_property_tree_falls_back_without_failing_the_app(
+    mock_session_cls: MagicMock, mock_engine: MagicMock
+) -> None:
+    replies = _sheet_replies(["ok"])
+    replies[-1] = RuntimeError("Method not found")
+    engine = _ScriptedEngine(
+        replies
+        + [
+            {"qReturn": {"qHandle": 3, "qType": "GenericObject"}},
+            _chart_layout("ok"),
+            {"qProp": {"qHyperCubeDef": {"qMeasures": []}}},
+        ]
+    )
+    app = _read_onprem_app(mock_session_cls, mock_engine, engine)
+
+    assert [chart.qId for chart in app.sheets[0].charts] == ["ok"]
+    assert app.read_complete
+    assert len(app.read_fallbacks) == 1
+
+
+@patch("datahub.ingestion.source.qlik_sense.qlik_sense.QlikOnPremAPI")
+def test_engine_read_fallbacks_are_reported_as_info(mock_onprem: MagicMock) -> None:
+    source = QlikSenseSource(
+        QlikSourceConfig.model_validate(ONPREM_CONFIG),
+        PipelineContext(run_id="test-onprem"),
+    )
+    app = App.model_validate(
+        {
+            "id": "app-1",
+            "qTitle": "Sales",
+            "createdDate": "2024-01-09T18:05:36.000Z",
+            "modifiedDate": "2024-01-09T18:05:36.000Z",
+            "spaceId": "stream-1",
+        }
+    )
+    app.read_fallbacks = ["Sheet sheet-1: unable to read the property tree"]
+    space = MagicMock()
+    space.name = "Everyone"
+
+    with patch.object(source, "_gen_app_workunit", return_value=[]):
+        list(source._gen_item_workunits(app, space, False))
+
+    assert [info.title for info in source.reporter.infos] == [
+        "Qlik Engine batch read unavailable"
+    ]
+    assert not source.reporter.failures
 
 
 @patch(
@@ -290,6 +541,7 @@ def test_onprem_reads_charts_after_a_failed_chart(
             RuntimeError("Access denied"),
             {"qReturn": {"qHandle": 3, "qType": "GenericObject"}},
             _chart_layout("ok"),
+            {"qProp": {}},
         ]
     )
     app = _read_onprem_app(mock_session_cls, mock_engine, engine)
@@ -297,8 +549,39 @@ def test_onprem_reads_charts_after_a_failed_chart(
     assert [chart.qId for chart in app.sheets[0].charts] == ["ok"]
     assert not app.sheets[0].charts_complete
     assert not app.read_complete
-    assert engine.sent_on[4:] == [("GetChild", 2), ("GetChild", 2), ("GetLayout", 3)]
+    assert engine.sent_on[4:] == [
+        ("GetFullPropertyTree", 2),
+        ("GetChild", 2),
+        ("GetChild", 2),
+        ("GetLayout", 3),
+        ("GetProperties", 3),
+        # The app's variables, read on the app handle.
+        ("CreateSessionObject", 1),
+    ]
     assert engine.handles == [-1, 1]
+
+
+@patch(
+    "datahub.ingestion.source.qlik_sense.qlik_onprem_api.WebsocketConnection.for_on_prem"
+)
+@patch("datahub.ingestion.source.qlik_sense.qlik_onprem_api.requests.Session")
+def test_onprem_unread_measures_keep_the_sheet_chart_list_complete(
+    mock_session_cls: MagicMock, mock_engine: MagicMock
+) -> None:
+    # The chart is listed, so the sheet's chart list can still be written.
+    engine = _ScriptedEngine(
+        _sheet_replies(["ok"])
+        + [
+            {"qReturn": {"qHandle": 3, "qType": "GenericObject"}},
+            _chart_layout("ok"),
+            RuntimeError("Access denied"),
+        ]
+    )
+    app = _read_onprem_app(mock_session_cls, mock_engine, engine)
+
+    assert [chart.qId for chart in app.sheets[0].charts] == ["ok"]
+    assert app.sheets[0].charts[0].fields_unread
+    assert app.sheets[0].charts_complete
 
 
 @patch(
@@ -333,8 +616,10 @@ def test_onprem_reads_charts_inside_containers(
             },
             {"qReturn": {"qHandle": 5}},
             untitled,
+            {"qProp": {}},
             {"qReturn": {"qHandle": 6}},
             _chart_layout("titled"),
+            {"qProp": {}},
         ]
     )
     app = _read_onprem_app(mock_session_cls, mock_engine, engine)
@@ -346,6 +631,66 @@ def test_onprem_reads_charts_inside_containers(
     assert app.read_complete
     assert ("GetChild", 4) in engine.sent_on
     assert engine.handles == [-1, 1]
+
+
+@patch(
+    "datahub.ingestion.source.qlik_sense.qlik_onprem_api.WebsocketConnection.for_on_prem"
+)
+@patch("datahub.ingestion.source.qlik_sense.qlik_onprem_api.requests.Session")
+def test_onprem_does_not_open_objects_that_are_not_charts(
+    mock_session_cls: MagicMock, mock_engine: MagicMock
+) -> None:
+    engine = _ScriptedEngine(
+        _sheet_replies(
+            ["filters", "sales"],
+            [
+                {"qInfo": {"qId": "filters", "qType": "filterpane"}},
+                {"qInfo": {"qId": "sales"}, "qHyperCubeDef": {"qMeasures": []}},
+            ],
+        )
+        + [{"qReturn": {"qHandle": 3}}, _chart_layout("sales")]
+    )
+    app = _read_onprem_app(mock_session_cls, mock_engine, engine)
+
+    assert [chart.qId for chart in app.sheets[0].charts] == ["sales"]
+    assert app.read_complete
+    assert [sent for sent in engine.sent_on if sent[0] == "GetChild"] == [
+        ("GetChild", 2)
+    ]
+
+
+@patch(
+    "datahub.ingestion.source.qlik_sense.qlik_onprem_api.WebsocketConnection.for_on_prem"
+)
+@patch("datahub.ingestion.source.qlik_sense.qlik_onprem_api.requests.Session")
+def test_onprem_reads_linked_master_visualization(
+    mock_session_cls: MagicMock, mock_engine: MagicMock
+) -> None:
+    layout = _chart_layout("linked")
+    layout["qLayout"]["qHyperCube"]["qMeasureInfo"] = [  # type: ignore[index]
+        {"qFallbackTitle": "Sales"}
+    ]
+    engine = _ScriptedEngine(
+        _sheet_replies(
+            ["linked"],
+            [{"qInfo": {"qId": "linked"}, "qExtendsId": "master-viz"}],
+        )
+        + [
+            {"qReturn": {"qHandle": 3}},
+            layout,
+            {
+                "qProp": {
+                    "qHyperCubeDef": {"qMeasures": [{"qDef": {"qDef": "Sum(Sales)"}}]}
+                }
+            },
+        ]
+    )
+    app = _read_onprem_app(mock_session_cls, mock_engine, engine)
+
+    (chart,) = app.sheets[0].charts
+    assert chart.field_expressions == ["Sum(Sales)"]
+    assert chart.fields_complete
+    assert ("GetEffectiveProperties", 3) in engine.sent_on
 
 
 @patch(
@@ -370,6 +715,7 @@ def test_onprem_container_that_holds_itself_is_read_once(
             container,
             {"qReturn": {"qHandle": 4}},
             _chart_layout("chart"),
+            {"qProp": {}},
         ]
     )
     app = _read_onprem_app(mock_session_cls, mock_engine, engine)
@@ -380,6 +726,520 @@ def test_onprem_container_that_holds_itself_is_read_once(
         ("GetChild", 2),
         ("GetChild", 3),
     ]
+
+
+@patch(
+    "datahub.ingestion.source.qlik_sense.qlik_onprem_api.WebsocketConnection.for_on_prem"
+)
+@patch("datahub.ingestion.source.qlik_sense.qlik_onprem_api.requests.Session")
+def test_onprem_reads_chart_field_expressions(
+    mock_session_cls: MagicMock, mock_engine: MagicMock
+) -> None:
+    layout = _chart_layout("sales")
+    layout["qLayout"]["qHyperCube"] = {  # type: ignore[index]
+        "qDimensionInfo": [{"qFallbackTitle": "Region", "qGroupFieldDefs": ["Region"]}],
+        "qMeasureInfo": [{"qFallbackTitle": "Sales"}, {"qFallbackTitle": "Orders"}],
+    }
+    engine = _ScriptedEngine(
+        _sheet_replies(
+            ["sales", "count"],
+            [
+                {
+                    "qInfo": {"qId": "sales"},
+                    "qHyperCubeDef": {
+                        "qMeasures": [
+                            {"qDef": {"qDef": "Sum([Net Sales])"}},
+                            {"qLibraryId": "orders", "qDef": {"qDef": ""}},
+                        ]
+                    },
+                },
+                {
+                    "qInfo": {"qId": "count"},
+                    "qHyperCubeDef": {"qMeasures": [{"qLibraryId": "orders"}]},
+                },
+            ],
+        )
+        + [
+            {"qReturn": {"qHandle": 3}},
+            layout,
+            {"qReturn": {"qHandle": 5}},
+            _chart_layout("count"),
+            {"qReturn": {"qHandle": 4, "qType": "GenericObject"}},
+            {
+                "qLayout": {
+                    "qMeasureList": {
+                        "qItems": [
+                            {
+                                "qInfo": {"qId": "orders"},
+                                "qData": {"measure": {"qDef": "Count(order_id)"}},
+                            }
+                        ]
+                    }
+                }
+            },
+        ]
+    )
+    app = _read_onprem_app(mock_session_cls, mock_engine, engine)
+
+    assert [chart.field_expressions for chart in app.sheets[0].charts] == [
+        ["Region", "Sum([Net Sales])", "Count(order_id)"],
+        ["Count(order_id)"],
+    ]
+    assert app.read_complete
+    assert not {"GetProperties", "GetMeasure"} & {
+        method for method, _ in engine.sent_on
+    }
+    assert engine.handles == [-1, 1]
+
+
+def test_chart_input_fields_match_app_fields() -> None:
+    orders = "urn:li:dataset:(urn:li:dataPlatform:qlik-sense,app-1.orders,PROD)"
+    customers = "urn:li:dataset:(urn:li:dataPlatform:qlik-sense,app-1.customers,PROD)"
+    app_fields = QlikSenseSource._index_app_fields(
+        {
+            orders: [SchemaField(name="order_id"), SchemaField(name="Net Sales")],
+            customers: [
+                SchemaField(name="order_id"),
+                SchemaField(name="Region"),
+                SchemaField(name="Segment"),
+            ],
+        }
+    )
+    chart = Chart.model_validate(_chart_layout("sales")["qLayout"])
+    chart.field_expressions = [
+        "Net Sales",
+        "=Upper(Region)",
+        # Data model field names are case-sensitive, so ORDER_ID is not order_id.
+        "Sum({<Region={\"Segment\", 'Net Sales'}>} [Net Sales]) / Count(ORDER_ID)",
+        # Segment is called as a function here, not read as a field.
+        "=Sum(Segment (order_id))",
+    ]
+
+    assert [
+        (field.dataset_urn, field.field.name)
+        for field in QlikSenseSource._get_chart_input_fields(chart, app_fields)
+    ] == [
+        (orders, "Net Sales"),
+        (customers, "Region"),
+        (orders, "order_id"),
+        (customers, "order_id"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "expressions, fields_complete, unknown_schema, matched_fields, keeps_all_tables",
+    [
+        pytest.param(
+            # Every table's fields are known, so the chart reads none of them.
+            ["Sum(unknown_field)"],
+            True,
+            False,
+            [],
+            False,
+            id="no_field_matches",
+        ),
+        pytest.param(
+            ["Region", "Sum($(vSales))"],
+            True,
+            False,
+            ["Region"],
+            True,
+            id="variable_measure",
+        ),
+        pytest.param(
+            [],
+            True,
+            False,
+            [],
+            False,
+            id="text_object_without_fields",
+        ),
+        pytest.param(
+            ["Count({<Year={$(vYear)}>} Region)"],
+            True,
+            False,
+            ["Region"],
+            False,
+            id="variable_in_set_modifier",
+        ),
+        pytest.param(
+            ["Count({<Year={$(=Only({1} Year))}>} Region)"],
+            True,
+            False,
+            ["Region"],
+            False,
+            id="nested_expansion_in_set_modifier",
+        ),
+        pytest.param(["Region"], False, False, ["Region"], True, id="unread_measure"),
+        pytest.param(
+            ["Region.autoCalendar.Year"],
+            True,
+            False,
+            ["Region"],
+            False,
+            id="derived_field_of_known_field",
+        ),
+        pytest.param(
+            ["[Region].autoCalendar.Year"],
+            True,
+            False,
+            ["Region"],
+            False,
+            id="bracketed_derived_field_of_known_field",
+        ),
+        pytest.param(
+            ["OrderDate.autoCalendar.Year", "Region"],
+            True,
+            False,
+            ["Region"],
+            True,
+            id="derived_field_of_unknown_field",
+        ),
+        pytest.param(
+            ["Region//$(vRegion)"],
+            True,
+            False,
+            ["Region"],
+            False,
+            id="variable_in_adjacent_comment",
+        ),
+        pytest.param(
+            ["Region // $(vRegion)", "Count(Region) /* $(vOld) */"],
+            True,
+            False,
+            ["Region"],
+            False,
+            id="variable_in_comment",
+        ),
+        pytest.param(
+            ["Region", "Sum(amount)"],
+            True,
+            True,
+            ["Region"],
+            True,
+            id="unmatched_name_with_unknown_schema",
+        ),
+        pytest.param(
+            ["Region"],
+            True,
+            True,
+            ["Region"],
+            False,
+            id="all_names_matched_with_unknown_schema",
+        ),
+        pytest.param(
+            ["Region", "Count(DISTINCT Region)"],
+            True,
+            True,
+            ["Region"],
+            False,
+            id="keyword_with_unknown_schema",
+        ),
+        pytest.param(
+            ["Count({<Year={2024}+{$(vYear)}>} Region)"],
+            True,
+            False,
+            ["Region"],
+            False,
+            id="variable_in_combined_set_values",
+        ),
+    ],
+)
+@patch("datahub.ingestion.source.qlik_sense.qlik_sense.QlikOnPremAPI")
+def test_chart_inputs_when_fields_are_unknown(
+    mock_onprem: MagicMock,
+    expressions: List[str],
+    fields_complete: bool,
+    unknown_schema: bool,
+    matched_fields: List[str],
+    keeps_all_tables: bool,
+) -> None:
+    source = QlikSenseSource(
+        QlikSourceConfig.model_validate(ONPREM_CONFIG),
+        PipelineContext(run_id="test-onprem"),
+    )
+    chart = Chart.model_validate(_chart_layout("sales")["qLayout"])
+    chart.field_expressions = expressions
+    chart.fields_complete = fields_complete
+    app_tables = [
+        "urn:li:dataset:(urn:li:dataPlatform:qlik-sense,app-1.orders,PROD)",
+        "urn:li:dataset:(urn:li:dataPlatform:qlik-sense,app-1.customers,PROD)",
+    ]
+    # A SQL SELECT * script table has no known columns.
+    app_fields = QlikSenseSource._index_app_fields(
+        {app_tables[0]: [], app_tables[1]: [SchemaField(name="Region")]}
+    )
+
+    inputs = source._chart_inputs([chart], {}, app_fields, app_tables, unknown_schema)
+    workunits = list(source._gen_charts_workunit([chart], inputs, "app-1"))
+    (chart_info,) = filter(
+        None, (wu.get_aspect_of_type(ChartInfoClass) for wu in workunits)
+    )
+    (input_fields,) = filter(
+        None, (wu.get_aspect_of_type(InputFieldsClass) for wu in workunits)
+    )
+
+    # Region is the only field, of customers; a chart reading none has no input.
+    read_tables = app_tables[1:] if matched_fields else []
+    assert chart_info.inputs == (app_tables if keeps_all_tables else read_tables)
+    assert [
+        field.schemaField.fieldPath
+        for field in input_fields.fields
+        if field.schemaField
+    ] == matched_fields
+
+
+def test_field_names_match_in_any_case_only_for_script_tables() -> None:
+    model_a = "urn:li:dataset:(urn:li:dataPlatform:qlik-sense,app-1.a,PROD)"
+    model_b = "urn:li:dataset:(urn:li:dataPlatform:qlik-sense,app-1.b,PROD)"
+    script = "urn:li:dataset:(urn:li:dataPlatform:qlik-sense,app-1.orders,PROD)"
+    app_fields = QlikSenseSource._index_app_fields(
+        {
+            model_a: [SchemaField(name="ID")],
+            model_b: [SchemaField(name="id")],
+            script: [SchemaField(name="amount")],
+        },
+        script_table_urns={script},
+    )
+    chart = Chart.model_validate(_chart_layout("sales")["qLayout"])
+    chart.field_expressions = ["ID", "Id", "Sum(Amount)"]
+
+    assert [
+        (field.dataset_urn, field.field.name)
+        for field in QlikSenseSource._get_chart_input_fields(chart, app_fields)
+    ] == [(model_a, "ID"), (script, "amount")]
+
+
+def test_exact_match_does_not_hide_script_table_in_other_case() -> None:
+    model = "urn:li:dataset:(urn:li:dataPlatform:qlik-sense,app-1.a,PROD)"
+    script = "urn:li:dataset:(urn:li:dataPlatform:qlik-sense,app-1.orders,PROD)"
+    app_fields = QlikSenseSource._index_app_fields(
+        {model: [SchemaField(name="order_id")], script: [SchemaField(name="ORDER_ID")]},
+        script_table_urns={script},
+    )
+    chart = Chart.model_validate(_chart_layout("sales")["qLayout"])
+    chart.field_expressions = ["Count(order_id)"]
+
+    assert [
+        (field.dataset_urn, field.field.name)
+        for field in QlikSenseSource._get_chart_input_fields(chart, app_fields)
+    ] == [(model, "order_id"), (script, "ORDER_ID")]
+
+
+def test_qualified_field_name_matches_before_derived_field() -> None:
+    table = "urn:li:dataset:(urn:li:dataPlatform:qlik-sense,app-1.orders,PROD)"
+    app_fields = QlikSenseSource._index_app_fields(
+        {table: [SchemaField(name="Orders.Region"), SchemaField(name="Orders")]}
+    )
+
+    assert QlikSenseSource._app_field_key("Orders.Region", app_fields) == (
+        "Orders.Region"
+    )
+    assert QlikSenseSource._app_field_key("Orders.autoCalendar.Year", app_fields) == (
+        "Orders"
+    )
+    assert QlikSenseSource._app_field_key("Customers.Region", app_fields) is None
+    # A field whose own name contains a dot keeps it when a suffix is derived.
+    assert (
+        QlikSenseSource._app_field_key("Orders.Region.autoCalendar.Year", app_fields)
+        == "Orders.Region"
+    )
+
+
+@pytest.mark.parametrize(
+    "reply, fields_complete, fields_unread",
+    [
+        pytest.param(
+            RuntimeError("Access denied"), False, True, id="properties_unread"
+        ),
+        pytest.param(
+            {"qProp": {"qHyperCubeDef": {"qMeasures": []}}},
+            False,
+            True,
+            id="fewer_measures_than_layout",
+        ),
+        pytest.param(
+            {"qProp": {"qHyperCubeDef": {"qMeasures": [{"qDef": {}}]}}},
+            False,
+            False,
+            id="measure_without_definition",
+        ),
+        pytest.param(
+            {
+                "qProp": {
+                    "qHyperCubeDef": {"qMeasures": [{"qDef": {"qDef": "Sum(Sales)"}}]}
+                }
+            },
+            True,
+            False,
+            id="measure_expression",
+        ),
+    ],
+)
+def test_measure_definitions_mark_unread_measures(
+    reply: object, fields_complete: bool, fields_unread: bool
+) -> None:
+    layout = _chart_layout("sales")["qLayout"]
+    layout["qHyperCube"]["qMeasureInfo"] = [{"qFallbackTitle": "Sales"}]  # type: ignore[index]
+    chart = Chart.model_validate(layout)
+    engine = _ScriptedEngine([reply])
+
+    engine._add_measure_definitions(chart, None, "sheet-1", on_error=lambda _: None)
+
+    assert chart.fields_complete is fields_complete
+    assert chart.fields_unread is fields_unread
+
+
+@pytest.mark.parametrize("fields_unread", [True, False])
+@patch("datahub.ingestion.source.qlik_sense.qlik_sense.QlikOnPremAPI")
+def test_input_fields_are_kept_when_measures_were_unread(
+    mock_onprem: MagicMock, fields_unread: bool
+) -> None:
+    source = QlikSenseSource(
+        QlikSourceConfig.model_validate(ONPREM_CONFIG),
+        PipelineContext(run_id="test-onprem"),
+    )
+    chart = Chart.model_validate(_chart_layout("sales")["qLayout"])
+    chart.field_expressions = ["Region"]
+    # A deleted master measure is incomplete too, but will not come back.
+    chart.fields_complete = False
+    chart.fields_unread = fields_unread
+    table = "urn:li:dataset:(urn:li:dataPlatform:qlik-sense,app-1.customers,PROD)"
+    app_fields = QlikSenseSource._index_app_fields(
+        {table: [SchemaField(name="Region")]}
+    )
+
+    inputs = source._chart_inputs([chart], {}, app_fields, [table], False)
+    workunits = list(source._gen_charts_workunit([chart], inputs, "app-1"))
+
+    assert any(wu.get_aspect_of_type(ChartInfoClass) for wu in workunits)
+    assert (
+        any(wu.get_aspect_of_type(InputFieldsClass) for wu in workunits)
+        is not fields_unread
+    )
+
+
+def test_measure_definitions_follow_linked_master_visualization() -> None:
+    chart = Chart.model_validate(_chart_layout("linked")["qLayout"])
+    engine = _ScriptedEngine(
+        [
+            {"qProp": {"qInfo": {"qId": "linked"}, "qExtendsId": "master-viz"}},
+            {
+                "qProp": {
+                    "qHyperCubeDef": {"qMeasures": [{"qDef": {"qDef": "Sum(Sales)"}}]}
+                }
+            },
+        ]
+    )
+
+    engine._add_measure_definitions(chart, None, "sheet-1", on_error=lambda _: None)
+
+    assert [method for method, _ in engine.sent_on] == [
+        "GetProperties",
+        "GetEffectiveProperties",
+    ]
+    assert chart.field_expressions == ["Sum(Sales)"]
+    assert chart.fields_complete
+
+
+@pytest.mark.parametrize(
+    "replies",
+    [
+        pytest.param(
+            [
+                {"qReturn": {"qHandle": 3}},
+                {"qLayout": {"qMeasureList": {"qItems": []}}},
+            ],
+            id="missing_from_list",
+        ),
+        pytest.param(
+            [
+                RuntimeError("Session objects not allowed"),
+                {"qReturn": {"qType": "GenericMeasure", "qHandle": None}},
+            ],
+            id="no_handle",
+        ),
+    ],
+)
+def test_deleted_master_measure_is_not_a_read_error(replies: List[object]) -> None:
+    chart = Chart.model_validate(_chart_layout("sales")["qLayout"])
+    chart.measure_library_ids = ["deleted"]
+    list_unreadable = isinstance(replies[0], Exception)
+    engine = _ScriptedEngine(replies)
+    errors: List[str] = []
+    fallbacks: List[str] = []
+
+    engine.add_master_measure_definitions(
+        [MagicMock(charts=[chart])], errors.append, fallbacks.append
+    )
+
+    assert errors == []
+    assert len(fallbacks) == list_unreadable
+    assert not chart.fields_unread
+    assert not chart.fields_complete
+    assert engine.replies == []
+    assert engine.handles == [-1]
+
+
+def test_unread_master_measure_marks_chart_fields_incomplete() -> None:
+    chart = Chart.model_validate(_chart_layout("sales")["qLayout"])
+    chart.measure_library_ids = ["measure-1", "measure-2"]
+    engine = _ScriptedEngine(
+        [
+            RuntimeError("Session objects not allowed"),
+            RuntimeError("Access denied"),
+            {"qReturn": {"qHandle": 3}},
+            {"qLayout": {"qMeasure": {"qDef": "Sum(Sales)"}}},
+        ]
+    )
+
+    engine.add_master_measure_definitions(
+        [MagicMock(charts=[chart])], on_error=lambda _: None, on_fallback=lambda _: None
+    )
+
+    assert "Sum(Sales)" in chart.field_expressions
+    assert not chart.fields_complete
+    assert chart.fields_unread
+
+
+def test_unreadable_master_measure_list_entry_falls_back_to_reading_one_by_one() -> (
+    None
+):
+    chart = Chart.model_validate(_chart_layout("sales")["qLayout"])
+    chart.measure_library_ids = ["measure-1"]
+    engine = _ScriptedEngine(
+        [
+            {"qReturn": {"qHandle": 3}},
+            {"qLayout": {"qMeasureList": {"qItems": [{"qData": {}}]}}},
+            {"qReturn": {"qHandle": 4}},
+            {"qLayout": {"qMeasure": {"qDef": "Sum(Sales)"}}},
+        ]
+    )
+    fallbacks: List[str] = []
+
+    engine.add_master_measure_definitions(
+        [MagicMock(charts=[chart])],
+        on_error=lambda _: None,
+        on_fallback=fallbacks.append,
+    )
+
+    assert len(fallbacks) == 1
+    assert chart.field_expressions[-1] == "Sum(Sales)"
+    assert chart.fields_complete
+
+
+@patch("datahub.ingestion.source.qlik_sense.qlik_sense.QlikOnPremAPI")
+@patch("datahub.ingestion.source.qlik_sense.qlik_sense.QlikAPI")
+def test_onprem_source_uses_onprem_client(
+    mock_cloud: MagicMock, mock_onprem: MagicMock
+) -> None:
+    QlikSenseSource(
+        QlikSourceConfig.model_validate(ONPREM_CONFIG),
+        PipelineContext(run_id="test-onprem"),
+    )
+
+    mock_onprem.assert_called_once()
+    mock_cloud.assert_not_called()
 
 
 def _script_tables(
@@ -460,6 +1320,24 @@ def test_onprem_script_tables_get_upstream_lineage(
         f"urn:li:dataset:(urn:li:dataPlatform:{expected_upstream})"
     ]
     assert set(tables[0].column_upstreams) == {"order_id", "amount"}
+
+
+@patch("datahub.ingestion.source.qlik_sense.qlik_sense.QlikOnPremAPI")
+def test_onprem_script_table_columns_take_preceding_load_names(
+    mock_onprem: MagicMock,
+) -> None:
+    script = """
+LIB CONNECT TO 'Sales SQL';
+Orders:
+LOAD order_id AS OrderID, amount AS [Net Sales];
+SQL SELECT order_id, amount FROM dbo.orders;
+"""
+    _, (table,) = _script_tables(mock_onprem, {}, script=script)
+
+    assert {
+        field: [urn.rsplit(",", 1)[-1] for urn in upstreams]
+        for field, upstreams in table.column_upstreams.items()
+    } == {"OrderID": ["order_id)"], "Net Sales": ["amount)"]}
 
 
 @patch("datahub.ingestion.source.qlik_sense.qlik_sense.QlikOnPremAPI")
@@ -649,7 +1527,7 @@ def test_onprem_qrs_errors_return_no_streams_or_apps(
     api = QlikOnPremAPI(QlikSourceConfig.model_validate(ONPREM_CONFIG))
 
     assert api.get_spaces() == []
-    assert api.get_items("stream-1") == []
+    assert list(api.get_items(["stream-1"])) == []
     assert api.get_data_connections() == {}
 
 
@@ -774,6 +1652,29 @@ def test_cloud_websocket_raises_engine_error(mock_connect: MagicMock) -> None:
         connection.get_script()
 
 
+@patch("datahub.ingestion.source.qlik_sense.qlik_api.requests.Session")
+@patch("datahub.ingestion.source.qlik_sense.qlik_api.WebsocketConnection")
+def test_cloud_app_read_failure_closes_engine_session(
+    mock_engine: MagicMock, mock_session_cls: MagicMock
+) -> None:
+    websocket = mock_engine.for_cloud.return_value
+    websocket.websocket_send_request.side_effect = RuntimeError("Access denied")
+    api = QlikAPI(
+        QlikSourceConfig.model_validate(
+            {"tenant_hostname": "tenant.example.com", "api_key": "key"}
+        )
+    )
+
+    assert (
+        api._load_item(
+            {Constant.RESOURCETYPE: Constant.APP, Constant.RESOURCEID: "app-1"}, None
+        )
+        is None
+    )
+    websocket.close_websocket.assert_called_once()
+    assert api.unread_items == [UnreadItem(name="app-1", cause="Access denied")]
+
+
 @patch("datahub.ingestion.source.qlik_sense.websocket_connection.create_connection")
 def test_onprem_websocket_skips_notifications(mock_connect: MagicMock) -> None:
     socket = MagicMock()
@@ -837,7 +1738,7 @@ def test_onprem_script_tables_workunits(mock_onprem: MagicMock) -> None:
     (subtypes,) = [
         subtype for wu in workunits if (subtype := wu.get_aspect_of_type(SubTypesClass))
     ]
-    assert subtypes.typeNames == [DatasetSubTypes.QLIK_DATASET]
+    assert subtypes.typeNames == [DatasetSubTypes.QLIK_TABLE]
 
 
 @patch("datahub.ingestion.source.qlik_sense.qlik_sense.QlikOnPremAPI")
@@ -941,7 +1842,7 @@ def test_onprem_unpublished_apps(
 
     spaces = api.get_spaces()
     for space in spaces:
-        api.get_items(space.id)
+        list(api.get_items([space.id]))
 
     assert [space.name for space in spaces] == (
         ["Everyone", UNPUBLISHED_APPS_NAME] if ingest_unpublished else ["Everyone"]
@@ -998,8 +1899,16 @@ def test_partly_read_app_does_not_overwrite_relationships(
     def emitted(aspect: type) -> bool:
         return any(wu.get_aspect_of_type(aspect) for wu in workunits)
 
-    assert emitted(DashboardInfoClass) is charts_complete
+    sheet_urn = source._gen_dashboard_urn(sheet.id)
+    assert (
+        any(
+            wu.get_urn() == sheet_urn and wu.get_aspect_of_type(DashboardInfoClass)
+            for wu in workunits
+        )
+        is charts_complete
+    )
     assert emitted(ChartInfoClass) is not tables_read_failed
+    assert emitted(InputFieldsClass) is not tables_read_failed
     chart_info_patches = [
         wu.metadata
         for wu in workunits
@@ -1061,6 +1970,7 @@ def test_onprem_unreadable_sheet_marks_app_partly_read(
 
     assert app.sheets == []
     assert not app.read_complete
+    assert not app.sheets_complete
     assert engine.handles == [-1, 1]
 
 
@@ -1184,3 +2094,260 @@ def test_onprem_test_connection_checks_the_engine_port(
     assert report.basic_connectivity is not None
     assert report.basic_connectivity.capable is engine_reachable
     assert mock_connect.call_args.args[0] == ("qlik.example.com", 4747)
+
+
+@pytest.mark.parametrize("mapping_first", [True, False])
+@patch("datahub.ingestion.source.qlik_sense.qlik_sense.QlikOnPremAPI")
+def test_mapping_table_does_not_hide_data_table_with_same_label(
+    mock_onprem: MagicMock, mapping_first: bool
+) -> None:
+    mapping_load = "Regions:\nMAPPING SQL SELECT region_code, region_name FROM sales_db.dbo.regions;"
+    data_load = (
+        "Regions:\nSQL SELECT region_code, manager FROM sales_db.dbo.region_managers;"
+    )
+    loads = [mapping_load, data_load] if mapping_first else [data_load, mapping_load]
+    source, tables = _script_tables(
+        mock_onprem, {}, script="\n".join(["LIB CONNECT TO 'Sales SQL';", *loads])
+    )
+
+    (table,) = tables
+    assert not table.mapping
+    assert table.upstream_urns == [
+        "urn:li:dataset:(urn:li:dataPlatform:mssql,sales_db.dbo.region_managers,PROD)"
+    ]
+    assert all(
+        "dbo.regions," not in urn
+        for urns in table.column_upstreams.values()
+        for urn in urns
+    )
+    assert [
+        field.name
+        for fields in source._app_table_fields([], tables).values()
+        for field in fields
+    ] == ["region_code", "manager"]
+
+
+@pytest.mark.parametrize("mapping_first", [True, False])
+@patch("datahub.ingestion.source.qlik_sense.qlik_sense.QlikOnPremAPI")
+def test_labels_differing_only_in_case_are_one_table(
+    mock_onprem: MagicMock, mapping_first: bool
+) -> None:
+    mapping_load = "REGIONS:\nMAPPING SQL SELECT region_code, region_name FROM sales_db.dbo.regions;"
+    data_loads = [
+        "Regions:\nSQL SELECT region_code, manager FROM sales_db.dbo.region_managers;",
+        "regions:\nSQL SELECT region_code, office FROM sales_db.dbo.region_offices;",
+    ]
+    loads = (
+        [mapping_load, *data_loads] if mapping_first else [*data_loads, mapping_load]
+    )
+    _, tables = _script_tables(
+        mock_onprem, {}, script="\n".join(["LIB CONNECT TO 'Sales SQL';", *loads])
+    )
+
+    (table,) = tables
+    assert table.identifier == "app-1.regions"
+    assert table.upstream_urns == [
+        "urn:li:dataset:(urn:li:dataPlatform:mssql,sales_db.dbo.region_managers,PROD)",
+        "urn:li:dataset:(urn:li:dataPlatform:mssql,sales_db.dbo.region_offices,PROD)",
+    ]
+    assert list(table.column_upstreams) == ["region_code", "manager", "office"]
+
+
+@patch("datahub.ingestion.source.qlik_sense.qlik_sense.QlikOnPremAPI")
+def test_mapping_tables_are_not_chart_inputs(mock_onprem: MagicMock) -> None:
+    source = QlikSenseSource(
+        QlikSourceConfig.model_validate(ONPREM_CONFIG),
+        PipelineContext(run_id="test-onprem"),
+    )
+    tables = [
+        ScriptTableLineage(
+            label="Map",
+            identifier="app-1.map",
+            column_upstreams={"k": []},
+            mapping=True,
+        ),
+        ScriptTableLineage(
+            label="Orders", identifier="app-1.orders", column_upstreams={"k": []}
+        ),
+    ]
+
+    assert list(source._app_table_fields([], tables)) == [
+        "urn:li:dataset:(urn:li:dataPlatform:qlik-sense,app-1.orders,PROD)"
+    ]
+
+
+@pytest.mark.parametrize(
+    "select",
+    [
+        pytest.param("region, jan, region", id="column_selected_twice"),
+        pytest.param("*", id="star"),
+    ],
+)
+@patch("datahub.ingestion.source.qlik_sense.qlik_sense.QlikOnPremAPI")
+def test_crosstable_on_select_of_unknown_column_order_keeps_table_lineage(
+    mock_onprem: MagicMock, select: str
+) -> None:
+    _, tables = _script_tables(
+        mock_onprem,
+        {},
+        script="LIB CONNECT TO 'Sales SQL';\n"
+        f"T: CrossTable(Month, Sales) SQL SELECT {select} FROM sales_db.dbo.sales;",
+    )
+
+    (table,) = tables
+    assert table.upstream_urns == [
+        "urn:li:dataset:(urn:li:dataPlatform:mssql,sales_db.dbo.sales,PROD)"
+    ]
+    assert table.column_upstreams == {}
+
+
+@pytest.mark.parametrize(
+    "load, expected_fields",
+    [
+        pytest.param(
+            "T: CrossTable(Month, Sales) LOAD region, jan, feb;",
+            {"region": ["region"], "Month": [], "Sales": ["jan", "feb"]},
+            id="crosstable",
+        ),
+        pytest.param("T: Generic LOAD region, jan, feb;", {}, id="generic"),
+    ],
+)
+@patch("datahub.ingestion.source.qlik_sense.qlik_sense.QlikOnPremAPI")
+def test_reshaped_script_tables_keep_only_traceable_fields(
+    mock_onprem: MagicMock, load: str, expected_fields: Dict[str, List[str]]
+) -> None:
+    _, tables = _script_tables(
+        mock_onprem,
+        {},
+        script="LIB CONNECT TO 'Sales SQL';\n"
+        f"{load}\n"
+        "SQL SELECT region, jan, feb FROM sales_db.dbo.sales;",
+    )
+
+    (table,) = tables
+    upstream = "urn:li:dataset:(urn:li:dataPlatform:mssql,sales_db.dbo.sales,PROD)"
+    assert table.upstream_urns == [upstream]
+    assert table.column_upstreams == {
+        field: [f"urn:li:schemaField:({upstream},{column})" for column in columns]
+        for field, columns in expected_fields.items()
+    }
+
+
+@patch(
+    "datahub.ingestion.source.qlik_sense.qlik_onprem_api.WebsocketConnection.for_on_prem"
+)
+@patch("datahub.ingestion.source.qlik_sense.qlik_onprem_api.requests.Session")
+def test_onprem_opens_app_with_data_to_read_its_data_model(
+    mock_session_cls: MagicMock, mock_engine: MagicMock
+) -> None:
+    session = mock_session_cls.return_value
+    session.headers = {}
+    session.get.side_effect = fake_qrs_get
+    websocket = MagicMock()
+    websocket.websocket_send_request.side_effect = fake_engine_calls()
+    websocket.get_script.return_value = LOAD_SCRIPT
+    websocket.get_data_model_tables.return_value = [
+        {
+            "qName": "Orders",
+            "qFields": [
+                {"qName": "order_id", "qTags": ["$numeric", "$integer"]},
+                {"qName": "amount", "qTags": ["$numeric"]},
+            ],
+        },
+        {"qName": "$Syn 1 Table", "qIsSynthetic": True},
+    ]
+    mock_engine.return_value = websocket
+    config = QlikSourceConfig.model_validate(
+        {"on_prem": {**ON_PREM, "read_data_model": True}}
+    )
+
+    api = QlikOnPremAPI(config)
+    api.get_spaces()
+    [app] = list(api.get_items(["stream-1"]))
+
+    open_doc = websocket.websocket_send_request.call_args_list[0].kwargs
+    assert open_doc["params"]["qNoData"] is False
+    assert isinstance(app, App)
+    assert [
+        (table.name, [(f.name, f.dataType) for f in table.fields])
+        for table in app.data_model_tables
+    ] == [("Orders", [("order_id", "INTEGER"), ("amount", "DOUBLE")])]
+    assert app.read_complete
+
+
+@patch(
+    "datahub.ingestion.source.qlik_sense.qlik_onprem_api.WebsocketConnection.for_on_prem"
+)
+@patch("datahub.ingestion.source.qlik_sense.qlik_onprem_api.requests.Session")
+def test_onprem_app_whose_data_model_cant_be_read_is_still_complete(
+    mock_session_cls: MagicMock, mock_engine: MagicMock
+) -> None:
+    session = mock_session_cls.return_value
+    session.headers = {}
+    session.get.side_effect = fake_qrs_get
+    websocket = MagicMock()
+    websocket.websocket_send_request.side_effect = fake_engine_calls()
+    websocket.get_script.return_value = LOAD_SCRIPT
+    websocket.get_variables.return_value = {}
+    websocket.get_data_model_tables.side_effect = TimeoutError("timed out")
+    mock_engine.return_value = websocket
+    config = QlikSourceConfig.model_validate(
+        {"on_prem": {**ON_PREM, "read_data_model": True}}
+    )
+
+    api = QlikOnPremAPI(config)
+    api.get_spaces()
+    [app] = list(api.get_items(["stream-1"]))
+
+    # As when opening with data fails: the script, sheets and QVDs stand, and
+    # the next run reads the data model again.
+    assert isinstance(app, App)
+    assert app.read_complete
+    assert app.data_load_failed
+    assert app.script == LOAD_SCRIPT
+    assert not app.data_model_tables
+    assert len(api.opened_without_data) == 1
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        EngineError({"code": 5, "message": "Access denied"}),
+        TimeoutError("Connection timed out"),
+    ],
+)
+@patch(
+    "datahub.ingestion.source.qlik_sense.qlik_onprem_api.WebsocketConnection.for_on_prem"
+)
+@patch("datahub.ingestion.source.qlik_sense.qlik_onprem_api.requests.Session")
+def test_onprem_app_whose_data_cant_be_opened_is_read_without_it(
+    mock_session_cls: MagicMock, mock_engine: MagicMock, error: Exception
+) -> None:
+    session = mock_session_cls.return_value
+    session.headers = {}
+    session.get.side_effect = fake_qrs_get
+    # Section access denies the data, or the data load times out.
+    with_data = MagicMock()
+    with_data.websocket_send_request.side_effect = error
+    without_data = MagicMock()
+    without_data.websocket_send_request.side_effect = fake_engine_calls()
+    without_data.get_script.return_value = LOAD_SCRIPT
+    without_data.get_variables.return_value = {}
+    mock_engine.side_effect = [with_data, without_data]
+    config = QlikSourceConfig.model_validate(
+        {"on_prem": {**ON_PREM, "read_data_model": True}}
+    )
+
+    api = QlikOnPremAPI(config)
+    api.get_spaces()
+    [app] = list(api.get_items(["stream-1"]))
+
+    open_doc = without_data.websocket_send_request.call_args_list[0].kwargs
+    assert open_doc["params"]["qNoData"] is True
+    assert isinstance(app, App)
+    assert app.read_complete
+    assert app.data_load_failed
+    assert app.script == LOAD_SCRIPT
+    assert not app.data_model_tables
+    without_data.get_data_model_tables.assert_not_called()
+    assert len(api.opened_without_data) == 1

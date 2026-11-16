@@ -1,3 +1,5 @@
+import hashlib
+import json
 import logging
 import secrets
 import socket
@@ -6,7 +8,8 @@ from datetime import datetime
 from typing import Any, Dict, Iterable, List, Literal, Optional, Union
 
 import requests
-from requests.adapters import HTTPAdapter
+from requests.adapters import DEFAULT_POOLSIZE, HTTPAdapter
+from websocket import WebSocketTimeoutException
 
 from datahub.ingestion.source.qlik_sense.config import (
     QLIK_DATETIME_FORMAT,
@@ -17,19 +20,54 @@ from datahub.ingestion.source.qlik_sense.data_classes import (
     App,
     Space,
     SpaceType,
+    UnchangedApp,
 )
 from datahub.ingestion.source.qlik_sense.qlik_base_api import (
+    UNREAD_DATA_CONNECTIONS,
+    IsUnchanged,
     QlikBaseAPI,
     ReadErrors,
+    log_read_error,
 )
 from datahub.ingestion.source.qlik_sense.script_lineage import DataConnectionInfo
-from datahub.ingestion.source.qlik_sense.websocket_connection import WebsocketConnection
+from datahub.ingestion.source.qlik_sense.websocket_connection import (
+    EngineError,
+    WebsocketConnection,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _data_load_failed(e: Exception) -> bool:
+    """Whether opening an app with its data failed on the data itself."""
+    return (isinstance(e, EngineError) and e.access_denied) or isinstance(
+        e, (TimeoutError, WebSocketTimeoutException)
+    )
+
 
 UNPUBLISHED_APPS_ID = "unpublished-apps"
 UNPUBLISHED_APPS_NAME = "Unpublished"
 _XRFKEY_LENGTH = 16
+# The Repository Service lists sheets, stories and master items as app objects with
+# their own modifiedDate, so object edits are caught even if the app's own
+# modifiedDate does not move.
+_APP_FINGERPRINT_FIELDS = (
+    "name",
+    "description",
+    "modifiedDate",
+    "lastReloadTime",
+    "published",
+    "publishTime",
+)
+_OBJECT_FINGERPRINT_FIELDS = (
+    "engineObjectId",
+    "objectType",
+    "name",
+    "modifiedDate",
+    "contentHash",
+    "published",
+    "approved",
+)
 
 
 class _QrsAdapter(HTTPAdapter):
@@ -37,10 +75,11 @@ class _QrsAdapter(HTTPAdapter):
         self,
         assert_hostname: Union[str, Literal[False], None],
         key_password: Optional[str],
+        pool_maxsize: int = DEFAULT_POOLSIZE,
     ) -> None:
         self._assert_hostname = assert_hostname
         self._key_password = key_password
-        super().__init__()
+        super().__init__(pool_maxsize=pool_maxsize)
 
     def init_poolmanager(self, *args: Any, **kwargs: Any) -> None:
         # Qlik server certificates are issued to the node name, so connecting by
@@ -106,11 +145,15 @@ class QlikOnPremAPI(QlikBaseAPI):
             if on_prem.client_key_password
             else None
         )
-        assert_hostname = on_prem.tls_assert_hostname()
-        if assert_hostname is not None or self.key_password:
-            self.session.mount(
-                self.qrs_url, _QrsAdapter(assert_hostname, self.key_password)
-            )
+        # Every worker can hold a connection at once.
+        self.session.mount(
+            self.qrs_url,
+            _QrsAdapter(
+                on_prem.tls_assert_hostname(),
+                self.key_password,
+                pool_maxsize=max(DEFAULT_POOLSIZE, config.resolved_max_workers()),
+            ),
+        )
         logger.info(f"Trying to connect to {self.qrs_url}")
         try:
             self._get("/about")
@@ -263,19 +306,24 @@ class QlikOnPremAPI(QlikBaseAPI):
             meta[Constant.OWNERID] = self._remember_owner(meta.get("owner"))
         return meta
 
-    def _load_item(self, item: Dict) -> Optional[App]:
+    def _load_item(
+        self, item: Dict, is_unchanged: Optional[IsUnchanged]
+    ) -> Union[App, UnchangedApp, None]:
         app_id = str(item.get(Constant.ID))
         try:
-            return self._read_app(item)
+            return self._read_or_skip_app(item, is_unchanged)
         except Exception as e:
             self._record_unread(
                 app_id, f"Unable to load app {app_id}. Exception: {e}", e
             )
         return None
 
-    def _read_app(self, app_dict: Dict) -> Optional[App]:
+    def _read_app(
+        self, app_dict: Dict, fingerprint: Optional[str] = None
+    ) -> Optional[App]:
         try:
             app = self._app_from_qrs(app_dict)
+            app.fingerprint = fingerprint
         except Exception as e:
             self._record_unread(
                 str(app_dict.get(Constant.ID)),
@@ -291,14 +339,24 @@ class QlikOnPremAPI(QlikBaseAPI):
                 f"Unable to connect to the Engine for app {app.id}. Exception: {e}"
             )
             app.read_errors = errors.messages
+            app.sheets_complete = False
             return app
+        with_data = self.on_prem.read_data_model
         try:
-            websocket_connection.websocket_send_request(
-                method="OpenDoc",
-                # Only metadata is read, and loading each app's data into the
-                # Engine takes minutes per app on large sites.
-                params={"qDocName": app.id, "qNoData": True},
-            )
+            try:
+                self._open_doc(websocket_connection, app.id, with_data)
+            except Exception as e:
+                if not (with_data and _data_load_failed(e)):
+                    raise
+                # Section access can deny the data to the service user, and a
+                # large app can time out while its data loads, but the app's
+                # script, sheets and variables are still readable without it.
+                self._close_engine(websocket_connection, app.id)
+                websocket_connection = self._open_engine(app.id)
+                self._open_doc(websocket_connection, app.id, with_data=False)
+                with_data = False
+                app.data_load_failed = True
+                self.opened_without_data.append(f"{app.id}: {e}")
             app.sheets = self._get_app_sheets(
                 websocket_connection,
                 app.id,
@@ -306,16 +364,107 @@ class QlikOnPremAPI(QlikBaseAPI):
                 # Every sheet of an unpublished app is still private.
                 keep_private=app.spaceId == UNPUBLISHED_APPS_ID,
             )
+            variables = self._read_variables(websocket_connection, app.id)
+            app.variables = variables or {}
+            app.variables_read_failed = variables is None
             app.script = self._read_load_script(
                 websocket_connection, app.id, on_error=errors.record
             )
             app.tables_read_failed = app.script is None
+            if with_data:
+                data_model_errors = ReadErrors()
+                app.data_model_tables = self._read_data_model(
+                    websocket_connection, app.id, data_model_errors
+                )
+                if data_model_errors.messages:
+                    # Read as an app opened without its data: the script,
+                    # sheets and QVDs are complete, and the next run tries the
+                    # data model again.
+                    app.data_load_failed = True
+                    self.opened_without_data.extend(
+                        f"{app.id}: {message}" for message in data_model_errors.messages
+                    )
         except Exception as e:
             errors.record(f"Unable to open app {app.id} in the Engine. Exception: {e}")
+            # It may have failed before the sheets were read.
+            errors.sheets_unread = True
         finally:
             self._close_engine(websocket_connection, app.id)
         app.read_errors = errors.messages
+        app.sheets_complete = not errors.sheets_unread
+        app.read_fallbacks = errors.fallbacks
         return app
+
+    @staticmethod
+    def _open_doc(
+        websocket_connection: WebsocketConnection, app_id: str, with_data: bool
+    ) -> None:
+        websocket_connection.websocket_send_request(
+            method="OpenDoc",
+            # Without its data the app has no data model to read, but it opens
+            # much faster on large sites.
+            params={"qDocName": app_id, "qNoData": not with_data},
+        )
+
+    def _read_or_skip_app(
+        self,
+        app_dict: Dict,
+        is_unchanged: Optional[IsUnchanged],
+    ) -> Union[App, UnchangedApp, None]:
+        fingerprint: Optional[str] = None
+        if is_unchanged:
+            # Dropping the app here would let stale entity removal delete it, so
+            # any error while checking for changes falls back to reading it.
+            try:
+                fingerprint = self._app_fingerprint(app_dict)
+                if fingerprint and is_unchanged(app_dict[Constant.ID], fingerprint):
+                    return UnchangedApp(
+                        id=app_dict[Constant.ID], fingerprint=fingerprint
+                    )
+            except Exception as e:
+                logger.warning(
+                    f"Unable to check whether app {app_dict.get(Constant.ID)} "
+                    f"changed, reading it instead. Exception: {e}"
+                )
+                self.change_check_failures.append(f"{app_dict.get(Constant.ID)}: {e}")
+        return self._read_app(app_dict, fingerprint)
+
+    def _app_fingerprint(self, app_dict: Dict) -> Optional[str]:
+        """Hash of everything the Repository Service knows about the app that the
+        Engine read depends on. None when it cannot be computed."""
+        try:
+            objects = self._get(
+                "/app/object/full",
+                params={"filter": f"app.id eq {app_dict[Constant.ID]}"},
+            ).json()
+        except Exception as e:
+            log_read_error(
+                f"Unable to fetch objects of app {app_dict.get(Constant.ID)}. Exception: {e}"
+            )
+            self.change_check_failures.append(
+                f"{app_dict.get(Constant.ID)}: unable to fetch app objects: {e}"
+            )
+            return None
+        owner = app_dict.get("owner") or {}
+        payload = {
+            "app": {key: app_dict.get(key) for key in _APP_FINGERPRINT_FIELDS},
+            "stream": (app_dict.get("stream") or {}).get(Constant.ID),
+            "owner": {key: owner.get(key) for key in ("id", "name", "userId")},
+            "objects": sorted(
+                json.dumps(
+                    {
+                        **{key: obj.get(key) for key in _OBJECT_FINGERPRINT_FIELDS},
+                        # A sheet that changes owner is read again.
+                        "owner": (obj.get("owner") or {}).get(Constant.ID),
+                    },
+                    sort_keys=True,
+                )
+                for obj in objects
+            ),
+        }
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True).encode("utf-8")
+        ).hexdigest()
 
     def get_data_connections(self) -> Dict[str, DataConnectionInfo]:
         connections: Dict[str, DataConnectionInfo] = {}
@@ -324,12 +473,15 @@ class QlikOnPremAPI(QlikBaseAPI):
                 name = connection.get(Constant.NAME)
                 if not name:
                     continue
-                connections[name] = self._infer_connection(
+                info = self._infer_connection(
                     name, connection, (Constant.CONNECTIONSTRING, Constant.TYPE)
                 )
+                if str(connection.get(Constant.TYPE) or "").lower() == "folder":
+                    info.folder_path = connection.get(Constant.CONNECTIONSTRING)
+                connections[name] = info
         except Exception as e:
             self._record_unread(
-                "data connections",
+                UNREAD_DATA_CONNECTIONS,
                 f"Unable to fetch data connections. Exception: {e}",
                 e,
             )
@@ -347,11 +499,13 @@ class QlikOnPremAPI(QlikBaseAPI):
             else f"stream.id eq {space_id}"
         )
         try:
-            return self._get("/app/full", params={"filter": qrs_filter}).json()
+            app_dicts = self._get("/app/full", params={"filter": qrs_filter}).json()
         except Exception as e:
             self._record_unread(
                 f"apps of stream {space_id}",
                 f"Unable to fetch apps. Exception: {e}",
                 e,
             )
-        return []
+            return []
+        logger.info(f"Stream {self.spaces[space_id]} has {len(app_dicts)} apps")
+        return app_dicts
